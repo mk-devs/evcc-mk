@@ -159,12 +159,20 @@ func (m *E3dc) CurrentPower() (float64, error) {
 		return rscpValue(*res, cast.ToFloat64E)
 
 	case templates.UsagePV:
-		res, err := m.retryMessages([]rscp.Message{
-			*rscp.NewMessage(rscp.EMS_REQ_POWER_PV, nil),
-			*rscp.NewMessage(rscp.EMS_REQ_POWER_ADD, nil),
-		})
-		if err != nil {
-			return 0, err
+		var questions []rscp.Message
+
+		if m.useInternalPower {
+			questions = append(questions, *rscp.NewMessage(rscp.EMS_REQ_POWER_PV, nil))
+		}
+
+		if m.useExternalPower {
+			questions = append(questions, *rscp.NewMessage(rscp.EMS_REQ_POWER_ADD, nil))
+		}
+
+		res, err := m.conn.SendMultiple(questions)
+
+		if e := m.retry(err); e != nil {
+			return 0, e
 		}
 
 		values, err := rscpValues(res, cast.ToFloat64E)
@@ -173,11 +181,11 @@ func (m *E3dc) CurrentPower() (float64, error) {
 		}
 
 		if m.useInternalPower && m.useExternalPower {
-			return values[0] - values[1], nil
+			return values[0] - values[1], nil // external power is inverse to internal
 		} else if m.useInternalPower && !m.useExternalPower {
 			return values[0], nil
 		} else if !m.useInternalPower && m.useExternalPower {
-			return values[0], nil
+			return -values[0], nil // external power is inverse to internal
 		} else {
 			return 0, nil
 		}
