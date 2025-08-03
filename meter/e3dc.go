@@ -213,7 +213,6 @@ func (m *E3dc) CurrentPower() (float64, error) {
 
 // TotalEnergy implements the api.MeterEnergy interface
 func (m *E3dc) TotalEnergy() (float64, error) {
-
 	switch m.usage {
 	case templates.UsageGrid:
 		_, _, _, total_energy, err := m.ReadFromPM(0, 1) // Verify type 1 for root meter
@@ -266,7 +265,6 @@ func (m *E3dc) TotalEnergy() (float64, error) {
 
 // Currents implements the api.PhaseCurrents interface
 func (m *E3dc) Currents() (float64, float64, float64, error) {
-
 	switch m.usage {
 	case templates.UsageGrid:
 		_, currents, _, _, err := m.ReadFromPM(0, 1) // Verify type 1 for root meter
@@ -304,7 +302,6 @@ func (m *E3dc) Currents() (float64, float64, float64, error) {
 
 // Voltages implements the api.PhaseVoltages interface
 func (m *E3dc) Voltages() (float64, float64, float64, error) {
-
 	switch m.usage {
 	case templates.UsageGrid:
 		voltages, _, _, _, err := m.ReadFromPM(0, 1)
@@ -400,7 +397,6 @@ func (m *E3dc) ReadFromPVI(pvi_idx uint16) ([3]float64, [3]float64, [3]float64, 
 	var power = [3]float64{0}
 	var current = [3]float64{0}
 	var energy = [3]float64{0}
-	var total_energy = float64(0)
 
 	request := *rscp.NewMessage(
 		rscp.PVI_REQ_DATA, []rscp.Message{
@@ -442,7 +438,7 @@ func (m *E3dc) ReadFromPVI(pvi_idx uint16) ([3]float64, [3]float64, [3]float64, 
 		default:
 		}
 	}
-	total_energy = energy[0] + energy[1] + energy[2]
+	total_energy := energy[0] + energy[1] + energy[2]
 	return voltage, current, power, total_energy / 1000, nil
 }
 
