@@ -29,7 +29,7 @@ func init() {
 	registry.Add("e3dc-rscp", NewE3dcFromConfig)
 }
 
-//go:generate go tool decorate -f decorateE3dc -b *E3dc -r api.Meter -t "api.Battery,Soc,func() (float64, error)" -t "api.BatteryCapacity,Capacity,func() float64" -t "api.BatteryController,SetBatteryMode,func(api.BatteryMode) error" -t "api.MaxACPowerGetter,MaxACPower,func() float64"
+//go:generate go tool decorate -f decorateE3dc -b *E3dc -r api.Meter -t "api.Battery,Soc,func() (float64, error)" -t "api.BatteryCapacity,Capacity,func() float64" -t "api.BatteryController,SetBatteryMode,func(api.BatteryMode) error" -t "api.MaxACPowerGetter,MaxACPower,func() float64" -t "api.PhaseVoltages,Voltages,func() (float64,float64,float64, error)" -t "api.PhaseCurrents,Currents,func() (float64,float64,float64, error)" -t "api.PhasePowers,Powers,func() (float64,float64,float64, error)" -t "api.MeterEnergy,TotalEnergy,func() (float64, error)"
 
 func NewE3dcFromConfig(other map[string]interface{}) (api.Meter, error) {
 	cc := struct {
@@ -104,15 +104,28 @@ func NewE3dc(cfg rscp.ClientConfig, usage templates.Usage, dischargeLimit uint32
 		batteryCapacity func() float64
 		batterySoc      func() (float64, error)
 		batteryMode     func(api.BatteryMode) error
+		phaseVoltages   func() (float64, float64, float64, error)
+		phasePower      func() (float64, float64, float64, error)
+		phaseCurrents   func() (float64, float64, float64, error)
+		totalEnergy     func() (float64, error)
 	)
 
-	if usage == templates.UsageBattery {
+	switch usage {
+	case templates.UsageBattery:
 		batteryCapacity = capacity
 		batterySoc = m.batterySoc
 		batteryMode = m.setBatteryMode
+	case templates.UsageGrid:
+		phaseVoltages = m.getPhaseVoltages
+		phasePower = m.getPhasePowers
+		totalEnergy = m.getTotalEnergy
+	case templates.UsagePV:
+		phaseVoltages = m.getPhaseVoltages
+		phasePower = m.getPhasePowers
+		totalEnergy = m.getTotalEnergy
 	}
 
-	return decorateE3dc(m, batterySoc, batteryCapacity, batteryMode, maxacpower), nil
+	return decorateE3dc(m, batterySoc, batteryCapacity, batteryMode, maxacpower, phaseVoltages, phaseCurrents, phasePower, totalEnergy), nil
 }
 
 // retryMessage executes a single message request with retry
@@ -253,7 +266,7 @@ func e3dcBatteryCharge(amount uint32) rscp.Message {
 	return *rscp.NewMessage(rscp.EMS_REQ_START_MANUAL_CHARGE, amount)
 }
 
-func (m *E3dc) Voltages() (float64, float64, float64, error) {
+func (m *E3dc) getPhaseVoltages() (float64, float64, float64, error) {
 	switch m.usage {
 	case templates.UsageGrid:
 		voltages, _, _, err := m.ReadFromPM(0, 1)
@@ -266,7 +279,7 @@ func (m *E3dc) Voltages() (float64, float64, float64, error) {
 	}
 }
 
-func (m *E3dc) Powers() (float64, float64, float64, error) {
+func (m *E3dc) getPhasePowers() (float64, float64, float64, error) {
 	switch m.usage {
 	case templates.UsageGrid:
 		_, power, _, err := m.ReadFromPM(0, 1) // Verify type 1 for root meter
@@ -280,7 +293,7 @@ func (m *E3dc) Powers() (float64, float64, float64, error) {
 }
 
 // TotalEnergy implements the api.MeterEnergy interface
-func (m *E3dc) TotalEnergy() (float64, error) {
+func (m *E3dc) getTotalEnergy() (float64, error) {
 
 	switch m.usage {
 	case templates.UsageGrid:
@@ -312,7 +325,7 @@ func (m *E3dc) TotalEnergy() (float64, error) {
 			}
 		}
 		total_energy += total_energy_int / 1000           // convert to kWh
-		_, _, total_energy_ext, err := m.ReadFromPM(2, 2) // Verify type 2 for external meter
+		_, _, total_energy_ext, err := m.ReadFromPM(1, 2) // Verify type 2 for external meter
 		if err != nil {
 			return 0, err
 		}
@@ -441,7 +454,7 @@ func rscpValuesWithTag[T any](msg []rscp.Message, fun func(any) (T, error)) ([]r
 				v, err = rscpValues(v_arr.Value.([]rscp.Message), fun)
 			case rscp.Error:
 				// Do nothing, just skip missing values e.g. when no external meter is configured
-				v = []T{*new(T)}
+				v = nil
 			default:
 				newVal, err = rscpValue(v_arr, fun)
 				v = []T{newVal}
