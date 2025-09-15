@@ -28,7 +28,7 @@ func init() {
 	registry.Add("e3dc-rscp", NewE3dcFromConfig)
 }
 
-//go:generate go tool decorate -f decorateE3dc -b *E3dc -r api.Meter -t "api.Battery,Soc,func() (float64, error)" -t "api.BatteryCapacity,Capacity,func() float64" -t "api.BatteryController,SetBatteryMode,func(api.BatteryMode) error" -t "api.MaxACPowerGetter,MaxACPower,func() float64" -t "api.PhaseVoltages,Voltages,func() (float64,float64,float64, error)" -t "api.PhaseCurrents,Currents,func() (float64,float64,float64, error)" -t "api.PhasePowers,Powers,func() (float64,float64,float64, error)"
+//go:generate go tool decorate -f decorateE3dc -b *E3dc -r api.Meter -t "api.Battery,Soc,func() (float64, error)" -t "api.BatteryCapacity,Capacity,func() float64" -t "api.BatteryController,SetBatteryMode,func(api.BatteryMode) error" -t "api.MaxACPowerGetter,MaxACPower,func() float64"
 
 func NewE3dcFromConfig(other map[string]interface{}) (api.Meter, error) {
 	cc := struct {
@@ -101,23 +101,15 @@ func NewE3dc(cfg rscp.ClientConfig, usage templates.Usage, dischargeLimit uint32
 		batteryCapacity func() float64
 		batterySoc      func() (float64, error)
 		batteryMode     func(api.BatteryMode) error
-		phaseCurrents   func() (float64, float64, float64, error)
-		phaseVoltages   func() (float64, float64, float64, error)
-		phasePower      func() (float64, float64, float64, error)
 	)
 
-	switch usage {
-	case templates.UsageBattery:
+	if usage == templates.UsageBattery {
 		batteryCapacity = capacity
 		batterySoc = m.batterySoc
 		batteryMode = m.setBatteryMode
-	case templates.UsageGrid:
-		phaseVoltages = m.getPhaseVoltages
-		phaseCurrents = m.getPhaseCurrents
-		phasePower = m.getPhasePower
 	}
 
-	return decorateE3dc(m, batterySoc, batteryCapacity, batteryMode, maxacpower, phaseVoltages, phaseCurrents, phasePower), nil
+	return decorateE3dc(m, batterySoc, batteryCapacity, batteryMode, maxacpower), nil
 }
 
 // retryMessage executes a single message request with retry
@@ -254,52 +246,39 @@ func e3dcBatteryCharge(amount uint32) rscp.Message {
 	return *rscp.NewMessage(rscp.EMS_REQ_START_MANUAL_CHARGE, amount)
 }
 
-func (m *E3dc) getPhaseVoltages() (float64, float64, float64, error) {
+func (m *E3dc) Voltages() (float64, float64, float64, error) {
 	switch m.usage {
 	case templates.UsageGrid:
-		voltages, _, _, _, err := m.ReadFromPM(0, 1)
+		voltages, _, _, err := m.ReadFromPM(0, 1)
 		if err != nil {
 			return 0, 0, 0, err
 		}
 		return voltages[0], voltages[1], voltages[2], nil
+	default:
+		return 0, 0, 0, api.ErrNotAvailable
 	}
-	return 0, 0, 0, nil
 }
 
-func (m *E3dc) getPhaseCurrents() (float64, float64, float64, error) {
-
+func (m *E3dc) Powers() (float64, float64, float64, error) {
 	switch m.usage {
 	case templates.UsageGrid:
-		_, currents, _, _, err := m.ReadFromPM(0, 1) // Verify type 1 for root meter
-		if err != nil {
-			return 0, 0, 0, err
-		}
-		return currents[0], currents[1], currents[2], nil
-	}
-	return 0, 0, 0, nil
-}
-
-func (m *E3dc) getPhasePower() (float64, float64, float64, error) {
-
-	switch m.usage {
-	case templates.UsageGrid:
-		_, _, power, _, err := m.ReadFromPM(0, 1) // Verify type 1 for root meter
+		_, power, _, err := m.ReadFromPM(0, 1) // Verify type 1 for root meter
 		if err != nil {
 			return 0, 0, 0, err
 		}
 		return power[0], power[1], power[2], nil
+	default:
+		return 0, 0, 0, api.ErrNotAvailable
 	}
-	return 0, 0, 0, nil
 }
 
 // Read voltage, current, power and energy from Powermeter namespace for the given powermeter index (usually 0 = ROOT = Grid and 1 = external PV inverter/generator)
-func (m *E3dc) ReadFromPM(pm_idx uint16, verfy_type int16) ([3]float64, [3]float64, [3]float64, float64, error) {
+func (m *E3dc) ReadFromPM(pm_idx uint16, verfy_type int16) ([3]float64, [3]float64, float64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	var voltage = [3]float64{0}
 	var power = [3]float64{0}
-	var current = [3]float64{0}
 	var total_energy = float64(0)
 
 	request := *rscp.NewMessage(
@@ -318,25 +297,24 @@ func (m *E3dc) ReadFromPM(pm_idx uint16, verfy_type int16) ([3]float64, [3]float
 		})
 	res, err := m.retryMessages([]rscp.Message{request})
 	if err != nil {
-		return [3]float64{0}, [3]float64{0}, [3]float64{0}, 0, err
+		return [3]float64{0}, [3]float64{0}, 0, err
 	}
 
 	tags, values, err := rscpValuesWithTag(res, cast.ToFloat64E)
 	if err != nil {
-		return [3]float64{0}, [3]float64{0}, [3]float64{0}, 0, err
+		return [3]float64{0}, [3]float64{0}, 0, err
 	}
 
 	for tag_idx := range tags {
 		switch tags[tag_idx] {
 		case rscp.PM_TYPE:
 			if verfy_type != -1 && values[tag_idx][0] != float64(verfy_type) {
-				return [3]float64{0}, [3]float64{0}, [3]float64{0}, 0, nil // Not the requested meter type
+				return [3]float64{0}, [3]float64{0}, 0, nil // Not the requested meter type
 			}
 		case rscp.PM_VOLTAGE_L1:
 			voltage[0] = values[tag_idx][0]
-			voltage[1] = values[tag_idx][0]
 		case rscp.PM_VOLTAGE_L2:
-			//voltage[1] = values[tag_idx][0]  // False reading on L2 use L1 instead
+			voltage[1] = values[tag_idx][0] // False reading on L2 sometimes possible
 		case rscp.PM_VOLTAGE_L3:
 			voltage[2] = values[tag_idx][0]
 		case rscp.PM_POWER_L1:
@@ -354,12 +332,14 @@ func (m *E3dc) ReadFromPM(pm_idx uint16, verfy_type int16) ([3]float64, [3]float
 		default:
 		}
 	}
-	if voltage[0] > 100 && voltage[1] > 100 && voltage[2] > 100 {
-		current[0] = power[0] / voltage[0]
-		current[1] = power[1] / voltage[1]
-		current[2] = power[2] / voltage[2]
+	// Fix wrong voltage readings on L2 and L3 when L1 is valid
+	if 100 < voltage[0] && voltage[0] < 280 && voltage[1] > 280 {
+		voltage[1] = voltage[0]
 	}
-	return voltage, current, power, total_energy / 1000, nil
+	if 100 < voltage[0] && voltage[0] < 280 && voltage[2] > 280 {
+		voltage[2] = voltage[0]
+	}
+	return voltage, power, total_energy / 1000, nil
 }
 
 func rscpError(msg ...rscp.Message) error {
