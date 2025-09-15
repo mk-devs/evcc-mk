@@ -279,6 +279,50 @@ func (m *E3dc) Powers() (float64, float64, float64, error) {
 	}
 }
 
+// TotalEnergy implements the api.MeterEnergy interface
+func (m *E3dc) TotalEnergy() (float64, error) {
+
+	switch m.usage {
+	case templates.UsageGrid:
+		_, _, total_energy, err := m.ReadFromPM(0, 1) // Verify type 1 for root meter
+		if err != nil {
+			return 0, err
+		}
+		return total_energy, nil
+	case templates.UsagePV:
+		total_energy := 0.0
+		m.mu.Lock()
+		res, err := m.retryMessages([]rscp.Message{*rscp.NewMessage(rscp.EMS_REQ_PV_ENERGY, nil)})
+		m.mu.Unlock()
+		if err != nil {
+			return 0, err
+		}
+		tags, values, err := rscpValuesWithTag(res, cast.ToFloat64E)
+		if err != nil {
+			return 0, err
+		}
+		total_energy_int := 0.0
+		for tag_idx := range tags {
+			if tags[tag_idx] == rscp.EMS_PARAM_AC_ENERGY_IN {
+				// this is the total energy produced by the inverter system per phase
+				for _, v := range values[tag_idx] {
+					total_energy_int += v
+				}
+				break
+			}
+		}
+		total_energy += total_energy_int / 1000           // convert to kWh
+		_, _, total_energy_ext, err := m.ReadFromPM(2, 2) // Verify type 2 for external meter
+		if err != nil {
+			return 0, err
+		}
+		total_energy += -total_energy_ext // external power is inverse to internal
+		return total_energy, nil
+	default:
+		return 0, api.ErrNotAvailable
+	}
+}
+
 // Read voltage, current, power and energy from Powermeter namespace for the given powermeter index (usually 0 = ROOT = Grid and 1 = external PV inverter/generator)
 func (m *E3dc) ReadFromPM(pm_idx uint16, verfy_type int16) ([3]float64, [3]float64, float64, error) {
 	m.mu.Lock()
@@ -392,9 +436,13 @@ func rscpValuesWithTag[T any](msg []rscp.Message, fun func(any) (T, error)) ([]r
 	var newVal T
 	for _, m := range msg {
 		for _, v_arr := range m.Value.([]rscp.Message) {
-			if v_arr.DataType == rscp.Container {
+			switch v_arr.DataType {
+			case rscp.Container:
 				v, err = rscpValues(v_arr.Value.([]rscp.Message), fun)
-			} else {
+			case rscp.Error:
+				// Do nothing, just skip missing values e.g. when no external meter is configured
+				v = []T{*new(T)}
+			default:
 				newVal, err = rscpValue(v_arr, fun)
 				v = []T{newVal}
 			}
