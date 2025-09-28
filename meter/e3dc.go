@@ -20,6 +20,7 @@ type E3dc struct {
 	mu             sync.Mutex
 	dischargeLimit uint32
 	externalPower  bool            // whether to include power of external sources
+	deviceIdx      uint8           // device index, usually 0 needed for powermeter and wallbox
 	usage          templates.Usage // TODO check if we really want to depend on templates
 	conn           *rscp.Client
 	retry          func() error
@@ -29,7 +30,7 @@ func init() {
 	registry.Add("e3dc-rscp", NewE3dcFromConfig)
 }
 
-//go:generate go tool decorate -f decorateE3dc -b *E3dc -r api.Meter -t "api.Battery,Soc,func() (float64, error)" -t "api.BatteryCapacity,Capacity,func() float64" -t "api.BatteryController,SetBatteryMode,func(api.BatteryMode) error" -t "api.MaxACPowerGetter,MaxACPower,func() float64" -t "api.PhaseVoltages,Voltages,func() (float64,float64,float64, error)" -t "api.PhaseCurrents,Currents,func() (float64,float64,float64, error)" -t "api.PhasePowers,Powers,func() (float64,float64,float64, error)" -t "api.MeterEnergy,TotalEnergy,func() (float64, error)"
+//go:generate go tool decorate -f decorateE3dc -b *E3dc -r api.Meter -t "api.Battery,Soc,func() (float64, error)" -t "api.BatteryCapacity,Capacity,func() float64" -t "api.BatteryController,SetBatteryMode,func(api.BatteryMode) error" -t "api.MaxACPowerGetter,MaxACPower,func() float64" -t "api.PhaseVoltages,Voltages,func() (float64,float64,float64, error)" -t "api.PhaseCurrents,Currents,func() (float64,float64,float64, error)" -t "api.PhasePowers,Powers,func() (float64, float64, float64, error)" -t "api.MeterEnergy,TotalEnergy,func() (float64, error)"
 
 func NewE3dcFromConfig(other map[string]interface{}) (api.Meter, error) {
 	cc := struct {
@@ -41,6 +42,7 @@ func NewE3dcFromConfig(other map[string]interface{}) (api.Meter, error) {
 		Password        string
 		Key             string
 		ExternalPower   bool
+		DeviceIndex     uint8
 		DischargeLimit  uint32
 		Timeout         time.Duration
 	}{
@@ -69,12 +71,12 @@ func NewE3dcFromConfig(other map[string]interface{}) (api.Meter, error) {
 		ReceiveTimeout:    cc.Timeout,
 	}
 
-	return NewE3dc(cfg, cc.Usage, cc.DischargeLimit, cc.ExternalPower, cc.batteryCapacity.Decorator(), cc.pvMaxACPower.Decorator())
+	return NewE3dc(cfg, cc.Usage, cc.DischargeLimit, cc.ExternalPower, cc.DeviceIndex, cc.batteryCapacity.Decorator(), cc.pvMaxACPower.Decorator())
 }
 
 var e3dcOnce sync.Once
 
-func NewE3dc(cfg rscp.ClientConfig, usage templates.Usage, dischargeLimit uint32, externalPower bool, capacity, maxacpower func() float64) (api.Meter, error) {
+func NewE3dc(cfg rscp.ClientConfig, usage templates.Usage, dischargeLimit uint32, externalPower bool, deviceIdx uint8, capacity, maxacpower func() float64) (api.Meter, error) {
 	e3dcOnce.Do(func() {
 		log := util.NewLogger("e3dc")
 		rscp.Log.SetLevel(logrus.DebugLevel)
@@ -91,6 +93,7 @@ func NewE3dc(cfg rscp.ClientConfig, usage templates.Usage, dischargeLimit uint32
 		conn:           conn,
 		externalPower:  externalPower,
 		dischargeLimit: dischargeLimit,
+		deviceIdx:      deviceIdx,
 	}
 
 	m.retry = func() (err error) {
@@ -99,13 +102,13 @@ func NewE3dc(cfg rscp.ClientConfig, usage templates.Usage, dischargeLimit uint32
 		return err
 	}
 
-	// decorate battery // grid
+	// decorate battery + grid  + PV diffrerently
 	var (
 		batteryCapacity func() float64
 		batterySoc      func() (float64, error)
 		batteryMode     func(api.BatteryMode) error
 		phaseVoltages   func() (float64, float64, float64, error)
-		phasePower      func() (float64, float64, float64, error)
+		phasePowers     func() (float64, float64, float64, error)
 		phaseCurrents   func() (float64, float64, float64, error)
 		totalEnergy     func() (float64, error)
 	)
@@ -117,15 +120,18 @@ func NewE3dc(cfg rscp.ClientConfig, usage templates.Usage, dischargeLimit uint32
 		batteryMode = m.setBatteryMode
 	case templates.UsageGrid:
 		phaseVoltages = m.getPhaseVoltages
-		phasePower = m.getPhasePowers
+		phasePowers = m.getPhasePowers
 		totalEnergy = m.getTotalEnergy
 	case templates.UsagePV:
 		phaseVoltages = m.getPhaseVoltages
-		phasePower = m.getPhasePowers
-		totalEnergy = m.getTotalEnergy
+		phaseCurrents = m.getPhaseCurrents
+		phasePowers = m.getPhasePowers
+		if !m.externalPower {
+			totalEnergy = m.getTotalEnergy
+		}
 	}
 
-	return decorateE3dc(m, batterySoc, batteryCapacity, batteryMode, maxacpower, phaseVoltages, phaseCurrents, phasePower, totalEnergy), nil
+	return decorateE3dc(m, batterySoc, batteryCapacity, batteryMode, maxacpower, phaseVoltages, phaseCurrents, phasePowers, totalEnergy), nil
 }
 
 // retryMessage executes a single message request with retry
@@ -199,7 +205,6 @@ func (m *E3dc) CurrentPower() (float64, error) {
 		}
 
 		return -pwr, nil
-
 	default:
 		return 0, api.ErrNotAvailable
 	}
@@ -274,6 +279,31 @@ func (m *E3dc) getPhaseVoltages() (float64, float64, float64, error) {
 			return 0, 0, 0, err
 		}
 		return voltages[0], voltages[1], voltages[2], nil
+	case templates.UsagePV:
+		voltages, _, _, _, err := m.ReadFromPVI(0)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		return voltages[0], voltages[1], voltages[2], nil
+	default:
+		return 0, 0, 0, api.ErrNotAvailable
+	}
+}
+
+func (m *E3dc) getPhaseCurrents() (float64, float64, float64, error) {
+	switch m.usage {
+	case templates.UsageGrid:
+		voltages, powers, _, err := m.ReadFromPM(0, 1)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		return powers[0] / voltages[0], powers[0] / voltages[0], powers[0] / voltages[0], nil
+	case templates.UsagePV:
+		_, currents, _, _, err := m.ReadFromPVI(0)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		return currents[0], currents[1], currents[2], nil
 	default:
 		return 0, 0, 0, api.ErrNotAvailable
 	}
@@ -287,6 +317,12 @@ func (m *E3dc) getPhasePowers() (float64, float64, float64, error) {
 			return 0, 0, 0, err
 		}
 		return power[0], power[1], power[2], nil
+	case templates.UsagePV:
+		_, _, power, _, err := m.ReadFromPVI(0)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		return power[0], power[1], power[2], nil
 	default:
 		return 0, 0, 0, api.ErrNotAvailable
 	}
@@ -294,7 +330,6 @@ func (m *E3dc) getPhasePowers() (float64, float64, float64, error) {
 
 // TotalEnergy implements the api.MeterEnergy interface
 func (m *E3dc) getTotalEnergy() (float64, error) {
-
 	switch m.usage {
 	case templates.UsageGrid:
 		_, _, total_energy, err := m.ReadFromPM(0, 1) // Verify type 1 for root meter
@@ -324,7 +359,10 @@ func (m *E3dc) getTotalEnergy() (float64, error) {
 				break
 			}
 		}
-		total_energy += total_energy_int / 1000           // convert to kWh
+		total_energy += total_energy_int / 1000 // convert to kWh
+		if !m.externalPower {                   // no external power, done
+			return total_energy, nil
+		}
 		_, _, total_energy_ext, err := m.ReadFromPM(1, 2) // Verify type 2 for external meter
 		if err != nil {
 			return 0, err
@@ -334,6 +372,66 @@ func (m *E3dc) getTotalEnergy() (float64, error) {
 	default:
 		return 0, api.ErrNotAvailable
 	}
+}
+
+// Read voltage, current, power and energy from PVI (inverter) namespace for the given inverter index
+func (m *E3dc) ReadFromPVI(pvi_idx uint16) ([3]float64, [3]float64, [3]float64, float64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var voltage = [3]float64{0}
+	var power = [3]float64{0}
+	var current = [3]float64{0}
+	var energy_pro = [3]float64{0}
+	var energy_con = [3]float64{0}
+
+	request := *rscp.NewMessage(
+		rscp.PVI_REQ_DATA, []rscp.Message{
+			*rscp.NewMessage(rscp.PVI_INDEX, pvi_idx),
+			*rscp.NewMessage(rscp.PVI_REQ_AC_ENERGY_ALL, uint8(0)),
+			*rscp.NewMessage(rscp.PVI_REQ_AC_ENERGY_ALL, uint8(1)),
+			*rscp.NewMessage(rscp.PVI_REQ_AC_ENERGY_ALL, uint8(2)),
+			*rscp.NewMessage(rscp.PVI_AC_ENERGY_GRID_CONSUMPTION, uint8(0)),
+			*rscp.NewMessage(rscp.PVI_AC_ENERGY_GRID_CONSUMPTION, uint8(1)),
+			*rscp.NewMessage(rscp.PVI_AC_ENERGY_GRID_CONSUMPTION, uint8(2)),
+			*rscp.NewMessage(rscp.PVI_REQ_AC_CURRENT, uint8(0)),
+			*rscp.NewMessage(rscp.PVI_REQ_AC_CURRENT, uint8(1)),
+			*rscp.NewMessage(rscp.PVI_REQ_AC_CURRENT, uint8(2)),
+			*rscp.NewMessage(rscp.PVI_REQ_AC_VOLTAGE, uint8(0)),
+			*rscp.NewMessage(rscp.PVI_REQ_AC_VOLTAGE, uint8(1)),
+			*rscp.NewMessage(rscp.PVI_REQ_AC_VOLTAGE, uint8(2)),
+			*rscp.NewMessage(rscp.PVI_REQ_AC_POWER, uint8(0)),
+			*rscp.NewMessage(rscp.PVI_REQ_AC_POWER, uint8(1)),
+			*rscp.NewMessage(rscp.PVI_REQ_AC_POWER, uint8(2)),
+		})
+	res, err := m.retryMessages([]rscp.Message{request})
+
+	if err != nil {
+		return [3]float64{0}, [3]float64{0}, [3]float64{0}, 0, err
+	}
+
+	tags, values, err := rscpValuesWithTag(res, cast.ToFloat64E)
+	if err != nil {
+		return [3]float64{0}, [3]float64{0}, [3]float64{0}, 0, err
+	}
+
+	for tag_idx := range tags {
+		switch tags[tag_idx] {
+		case rscp.PVI_AC_VOLTAGE:
+			voltage[uint16(values[tag_idx][0])] = values[tag_idx][1]
+		case rscp.PVI_AC_POWER:
+			power[uint16(values[tag_idx][0])] = values[tag_idx][1]
+		case rscp.PVI_AC_CURRENT:
+			current[uint16(values[tag_idx][0])] = values[tag_idx][1]
+		case rscp.PVI_AC_ENERGY_ALL:
+			energy_pro[uint16(values[tag_idx][0])] = values[tag_idx][1]
+		case rscp.PVI_AC_ENERGY_GRID_CONSUMPTION:
+			energy_con[uint16(values[tag_idx][0])] = values[tag_idx][1]
+		default:
+		}
+	}
+	total_energy := energy_pro[0] + energy_pro[1] + energy_pro[2] - energy_con[0] - energy_con[1] - energy_con[2]
+	return voltage, current, power, total_energy / 1000, nil
 }
 
 // Read voltage, current, power and energy from Powermeter namespace for the given powermeter index (usually 0 = ROOT = Grid and 1 = external PV inverter/generator)
@@ -396,14 +494,78 @@ func (m *E3dc) ReadFromPM(pm_idx uint16, verfy_type int16) ([3]float64, [3]float
 		default:
 		}
 	}
-	// Fix wrong voltage readings on L2 and L3 when L1 is valid
+
 	if 100 < voltage[0] && voltage[0] < 280 && voltage[1] > 280 {
-		voltage[1] = voltage[0]
-	}
-	if 100 < voltage[0] && voltage[0] < 280 && voltage[2] > 280 {
-		voltage[2] = voltage[0]
+		// voltage[1] = voltage[0]
+		voltage[1] = 230
 	}
 	return voltage, power, total_energy / 1000, nil
+}
+
+// Read current, power and energy from Wallbox on E3DC
+func (m *E3dc) ReadFromWB(wb_idx uint16) ([3]float64, float64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var power = [3]float64{0}
+	var total_energy = float64(0)
+
+	request := *rscp.NewMessage(
+		rscp.WB_REQ_DATA, []rscp.Message{
+			*rscp.NewMessage(rscp.WB_INDEX, wb_idx),
+			*rscp.NewMessage(rscp.WB_STATUS, nil),
+			*rscp.NewMessage(rscp.WB_REQ_ENERGY_ALL, nil),
+			*rscp.NewMessage(rscp.WB_REQ_ENERGY_SOLAR, nil),
+			*rscp.NewMessage(rscp.WB_REQ_SOC, nil),
+			*rscp.NewMessage(rscp.WB_REQ_ERROR_CODE, nil),
+			*rscp.NewMessage(rscp.WB_REQ_DEVICE_NAME, nil),
+			*rscp.NewMessage(rscp.WB_REQ_MODE, nil),
+			*rscp.NewMessage(rscp.WB_REQ_AVAILABLE_SOLAR_POWER, nil),
+			// Grid Power
+			// Total-Power
+			*rscp.NewMessage(rscp.WB_REQ_SUN_MODE_ACTIVE, nil),
+			*rscp.NewMessage(rscp.WB_REQ_MAX_CHARGE_CURRENT, nil),
+			*rscp.NewMessage(rscp.WB_REQ_PM_ACTIVE_PHASES, nil),
+
+			*rscp.NewMessage(rscp.WB_REQ_PM_ENERGY_L1, nil),
+			*rscp.NewMessage(rscp.WB_REQ_PM_ENERGY_L2, nil),
+			*rscp.NewMessage(rscp.WB_REQ_PM_ENERGY_L3, nil),
+			*rscp.NewMessage(rscp.WB_REQ_PM_POWER_L1, nil),
+			*rscp.NewMessage(rscp.WB_REQ_PM_POWER_L2, nil),
+			*rscp.NewMessage(rscp.WB_REQ_PM_POWER_L3, nil),
+
+			*rscp.NewMessage(rscp.WB_REQ_PROXIMITY_PLUG, nil),
+			*rscp.NewMessage(rscp.WB_REQ_PM_MODE, nil),
+			*rscp.NewMessage(rscp.WB_REQ_CONNECTED_DEVICES, nil),
+		})
+	res, err := m.retryMessages([]rscp.Message{request})
+	if err != nil {
+		return [3]float64{0}, 0, err
+	}
+
+	tags, values, err := rscpValuesWithTag(res, cast.ToFloat64E)
+	if err != nil {
+		return [3]float64{0}, 0, err
+	}
+
+	for tag_idx := range tags {
+		switch tags[tag_idx] {
+		case rscp.WB_PM_POWER_L1:
+			power[0] = values[tag_idx][0]
+		case rscp.WB_PM_POWER_L2:
+			power[1] = values[tag_idx][0]
+		case rscp.WB_PM_POWER_L3:
+			power[2] = values[tag_idx][0]
+		case rscp.WB_PM_ENERGY_L1:
+			total_energy += values[tag_idx][0]
+		case rscp.WB_PM_ENERGY_L2:
+			total_energy += values[tag_idx][0]
+		case rscp.WB_PM_ENERGY_L3:
+			total_energy += values[tag_idx][0]
+		default:
+		}
+	}
+	return power, total_energy / 1000, nil
 }
 
 func rscpError(msg ...rscp.Message) error {
