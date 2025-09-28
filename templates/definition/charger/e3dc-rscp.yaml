@@ -1,0 +1,37 @@
+template: e3dc-rscp
+products:
+  - brand: E3/DC
+    description:
+      generic: CAN-BUS
+capabilities: ["1p3p", "rfid"]
+requirements:
+  description:
+    de: |
+      Benutzername und Passwort sind identisch zum Web-Portal bzw. My E3/DC App. Key (=RSCP-Passwort) muss im Hauskraftwerk unter Personalisieren/Benutzerprofil angelegt werden. Die IP-Adressen von evcc und des Hauskraftwerks müssen sich im selben Subnetz befinden.
+    en: |
+      Username and password are identical to Web Portal or My E3/DC App access. Key (=RSCP-Password) must be set in the E3/DC system at Personalize/User Profile. The IP adresses of evcc and E3/DC system must be in the same subnet.
+params:
+  - name: host
+  - name: port
+    default: 5033
+  - name: user
+    required: true
+  - name: password
+    required: true
+  - name: key
+    description:
+      generic: RSCP-Password
+    required: true
+  - name: deviceindex
+    type: int
+    description:
+      de: Index der Wallbox (0=erste, 1=zweite, ...)
+      en: Index of the wallbox (0=first, 1=second, ...)
+    required: true
+render: |
+  type: e3dc-rscp
+  uri: {{ .host }}:{{ .port }}
+  user: {{ .user }}
+  password: {{ .password }}
+  key: {{ .key }}
+  deviceindex: {{ .deviceindex }}
